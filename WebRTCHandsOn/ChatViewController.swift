@@ -39,7 +39,7 @@ class ChatViewController: UIViewController, WebSocketDelegate, RTCPeerConnection
         startVideo()
         
         websocket = WebSocket(url: URL(string:
-            "wss://conf.space/WebRTCHandsOnSig/tom19911201")!)
+            "yourURL")!)
         websocket.delegate = self
         websocket.connect()
 
