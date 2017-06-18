@@ -11,7 +11,7 @@ import WebRTC
 import Starscream
 import SwiftyJSON
 
-class ChatViewController: UIViewController, WebSocketDelegate, RTCPeerConnectionDelegate {
+class ChatViewController: UIViewController, WebSocketDelegate, RTCPeerConnectionDelegate, RTCEAGLVideoViewDelegate {
 
     @IBOutlet weak var remoteVideoView: RTCEAGLVideoView!
     @IBOutlet weak var cameraPreview: RTCCameraPreviewView!
@@ -20,18 +20,20 @@ class ChatViewController: UIViewController, WebSocketDelegate, RTCPeerConnection
     
     //WebRTCの処理
     var peerConnectionFactory: RTCPeerConnectionFactory! = nil
+    var peerConnection: RTCPeerConnection! = nil
+    var remoteVideoTrack: RTCVideoTrack?
     
     //映像、音声ソースの取得処理
     var audioSource: RTCAudioSource?
     var videoSource: RTCAVFoundationVideoSource?
     
-    //映像・音声の追加
-    var peerConnection: RTCPeerConnection! = nil
     
     
     override func viewDidLoad() {
         super.viewDidLoad()
         
+        remoteVideoView.delegate = self
+        // RTCPeerConnectionFactoryの初期化
         peerConnectionFactory = RTCPeerConnectionFactory()
         
         startVideo()
@@ -68,6 +70,10 @@ class ChatViewController: UIViewController, WebSocketDelegate, RTCPeerConnection
         // Connectボタンを押した時
         if peerConnection == nil {
             peerConnection = prepareNewConnection()
+            LOG("make Offer")
+            makeOffer()
+        } else {
+            LOG("peer already exist.")
         }
     }
     
@@ -117,6 +123,79 @@ class ChatViewController: UIViewController, WebSocketDelegate, RTCPeerConnection
         self.peerConnection.offer(for: constraints,
                                   completionHandler: offerCompletion)
     }
+    
+    //受信処理
+    func setAnswer(_ answer: RTCSessionDescription) {
+        if peerConnection == nil {
+            LOG("peerConnection NOT exist!")
+            return
+        }
+        // 受け取ったSDPを相手のSDPとして設定
+        self.peerConnection.setRemoteDescription(answer,
+                                                 completionHandler: {
+                                                    (error: Error?) in
+                                                    if error == nil {
+                                                        self.LOG("setRemoteDescription(answer) succsess")
+                                                    } else {
+                                                        self.LOG("setRemoteDescription(answer) ERROR: " + error.debugDescription)
+                                                    }
+        })
+    }
+    
+    //setOffer
+    func setOffer(_ offer: RTCSessionDescription) {
+        if peerConnection != nil {
+            LOG("peerConnection alreay exist!")
+        }
+        // PeerConnectionを生成する
+        peerConnection = prepareNewConnection()
+        self.peerConnection.setRemoteDescription(offer, completionHandler: {(error: Error?) in
+            if error == nil {
+                self.LOG("setRemoteDescription(offer) succsess")
+                // setRemoteDescriptionが成功したらAnswerを作る
+                self.makeAnswer()
+            } else {
+                self.LOG("setRemoteDescription(offer) ERROR: " + error.debugDescription)
+            }
+        })
+    }
+    
+    //makeAnswer
+    func makeAnswer() {
+        LOG("sending Answer. Creating remote session description...")
+        if peerConnection == nil {
+            LOG("peerConnection NOT exist!")
+            return
+        }
+        let constraints = RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil)
+        let answerCompletion = { (answer: RTCSessionDescription?, error: Error?) in
+            if error != nil { return }
+            self.LOG("createAnswer() succsess")
+            let setLocalDescCompletion = {(error: Error?) in
+                if error != nil { return }
+                self.LOG("setLocalDescription() succsess")
+                // 相手に送る
+                self.sendSDP(answer!)
+            }
+            self.peerConnection.setLocalDescription(answer!, completionHandler: setLocalDescCompletion)
+        }
+        // Answerを生成
+        self.peerConnection.answer(for: constraints, completionHandler: answerCompletion)
+    }
+    
+    //Aspect ratio
+    func videoView(_ videoView: RTCEAGLVideoView,
+                   didChangeVideoSize size: CGSize) {
+        let width = self.view.frame.width
+        let height =
+            self.view.frame.width * size.height / size.width
+        videoView.frame = CGRect(
+            x: 0,
+            y: (self.view.frame.height - height) / 2,
+            width: width,
+            height: height)
+    }
+    
     
     
     /*
@@ -196,10 +275,35 @@ class ChatViewController: UIViewController, WebSocketDelegate, RTCPeerConnection
         if peerConnection != nil {
             if peerConnection.iceConnectionState != RTCIceConnectionState.closed {
                 peerConnection.close()
+                let jsonClose: JSON = [
+                    "type": "close"
+                ]
+                LOG("sending close message")
+                websocket.write(string: jsonClose.rawString()!)
             }
+            if remoteVideoTrack != nil {
+                remoteVideoTrack?.remove(remoteVideoView)
+            }
+            remoteVideoTrack = nil
             peerConnection = nil
             LOG("peerConnection is closed.")
         }
+    }
+    
+    //candidateを送る処理
+    func sendIceCandidate(_ candidate: RTCIceCandidate) {
+        LOG("---sending ICE candidate ---")
+        let jsonCandidate: JSON = [
+            "type": "candidate",
+            "ice": [
+                "candidate": candidate.sdp,
+                "sdpMLineIndex": candidate.sdpMLineIndex,
+                "sdpMid": candidate.sdpMid!
+            ]
+        ]
+        let message = jsonCandidate.rawString()!
+        LOG("sending candidate=" + message)
+        websocket.write(string: message)
     }
     
     
@@ -222,9 +326,52 @@ class ChatViewController: UIViewController, WebSocketDelegate, RTCPeerConnection
         LOG("error: \(String(describing: error?.localizedDescription))")
     }
     
-    func websocketDidReceiveMessage(socket: WebSocket,
-                                    text: String) {
+    func websocketDidReceiveMessage(socket: WebSocket,text: String) {
         LOG("message: \(text)")
+        // 受け取ったメッセージをJSONとしてパース
+        let jsonMessage = JSON.parse(text)
+        let type = jsonMessage["type"].stringValue
+        switch (type) {
+        case "answer":
+            // answerを受け取った時の処理
+            LOG("Received answer ...")
+            let answer = RTCSessionDescription(
+                type: RTCSessionDescription.type(for: type),
+                sdp: jsonMessage["sdp"].stringValue)
+            setAnswer(answer)
+            
+        case "candidate":
+            LOG("Received ICE candidate ...")
+            let candidate = RTCIceCandidate(
+                sdp: jsonMessage["ice"]["candidate"].stringValue,
+                sdpMLineIndex:
+                jsonMessage["ice"]["sdpMLineIndex"].int32Value,
+                sdpMid: jsonMessage["ice"]["sdpMid"].stringValue)
+            addIceCandidate(candidate)
+            
+        case "offer":
+            // offerを受け取った時の処理
+            LOG("Received offer ...")
+            let offer = RTCSessionDescription(
+                type: RTCSessionDescription.type(for: type),
+                sdp: jsonMessage["sdp"].stringValue)
+            setOffer(offer)
+            
+        case "close":
+            LOG("peer is closed ...")
+            hangUp()
+            
+        default:
+            return
+        }
+    }
+    
+    func addIceCandidate(_ candidate: RTCIceCandidate) {
+        if peerConnection != nil {
+            peerConnection.add(candidate)
+        } else {
+            LOG("PeerConnection not exist!")
+        }
     }
     
     func websocketDidReceiveData(socket: WebSocket,
@@ -242,6 +389,16 @@ class ChatViewController: UIViewController, WebSocketDelegate, RTCPeerConnection
     func peerConnection(_ peerConnection: RTCPeerConnection,
                         didAdd stream: RTCMediaStream) {
         // 映像/音声が追加された際に呼ばれます
+        LOG("-- peer.onaddstream()")
+        DispatchQueue.main.async(execute: { () -> Void in
+            // mainスレッドで実行
+            if (stream.videoTracks.count > 0) {
+                // ビデオのトラックを取り出して
+                self.remoteVideoTrack = stream.videoTracks[0]
+                // remoteVideoViewに紐づける
+                self.remoteVideoTrack?.add(self.remoteVideoView)
+            }
+        })
     }
     
     func peerConnection(_ peerConnection: RTCPeerConnection,
@@ -287,6 +444,11 @@ class ChatViewController: UIViewController, WebSocketDelegate, RTCPeerConnection
     func peerConnection(_ peerConnection: RTCPeerConnection,
                         didGenerate candidate: RTCIceCandidate) {
         // Candidate(自分への接続先候補情報)が生成された際に呼ばれます
+        if candidate.sdpMid != nil {
+            sendIceCandidate(candidate)
+        } else {
+            LOG("empty ice event")
+        }
     }
     
     func peerConnection(_ peerConnection: RTCPeerConnection,
